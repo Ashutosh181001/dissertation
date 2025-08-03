@@ -1,158 +1,249 @@
-import streamlit as st
-import pandas as pd
-import os
-import time
-import plotly.express as px
-from streamlit_autorefresh import st_autorefresh
+"""
+Improved BTC/USDT anomaly detection dashboard using Streamlit fragments.
 
-# --- Config ---
+This app is functionally similar to the original Streamlit dashboard, but
+the charts and data update asynchronously inside a fragment.  By placing
+the expensive I/O and plotting logic in a fragment decorated with
+``@st.fragment(run_every=…)``, only that part of the page refreshes on
+a timer.  The rest of the UI (title, sidebar controls and download
+buttons) remains static, so the user never sees the page flash or a
+long-running spinner when new trades arrive.
+
+To run this app locally, install Streamlit version >= 1.37.0 and
+Plotly.  Then execute ``streamlit run improved_dashboard.py``.  The app
+will watch the ``trades.csv`` and ``anomalies.csv`` files in the same
+directory and update charts in real time according to the selected
+refresh interval.
+
+Refer to the Streamlit documentation on fragments for more details
+about how fragment reruns work and how to control the refresh interval
+with ``run_every``【365608622546187†L181-L198】【551314107550257†L180-L186】.
+"""
+
+import os
+from datetime import datetime, timedelta
+from typing import List
+
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+
+
+# -----------------------------------------------------------------------------
+# Configuration constants
+#
+# These constants control file locations and the size of the rolling buffer of
+# live trades displayed.  Adjust them as needed to suit your data and
+# environment.
 TRADE_LOG = "trades.csv"
 ANOMALY_LOG = "anomalies.csv"
-REFRESH_INTERVAL = 5
+MAX_BUFFER = 400            # number of most recent trades to display
+DEFAULT_REFRESH = 5          # default refresh interval in seconds
 
-st.set_page_config(page_title="BTC Anomaly Monitor", layout="wide")
-st.title("📊 BTC/USDT Anomaly Detection Dashboard")
 
-st.sidebar.header("View Mode")
-view_mode = st.sidebar.radio("Select mode:", ["Live", "Historical"])
+def load_recent_trades(max_buffer: int) -> pd.DataFrame:
+    """Load the most recent trades from ``TRADE_LOG``.
 
-if view_mode == "Historical":
-    interval = st.sidebar.selectbox("Group by", ["Hourly", "Daily"])
-else:
-    auto_refresh = st.sidebar.checkbox("Auto-refresh", value=True)
-    refresh_rate = st.sidebar.slider("Refresh every (s)", 2, 30, REFRESH_INTERVAL)
+    Parameters
+    ----------
+    max_buffer: int
+        The maximum number of rows to return.  Older rows are discarded.
 
-@st.cache_data(ttl=5)
-def load_data():
-    trades = pd.read_csv(TRADE_LOG, parse_dates=["timestamp"]) if os.path.exists(TRADE_LOG) else pd.DataFrame()
-    anomalies = pd.read_csv(ANOMALY_LOG, parse_dates=["timestamp"]) if os.path.exists(ANOMALY_LOG) else pd.DataFrame()
-    return trades, anomalies
+    Returns
+    -------
+    pd.DataFrame
+        A DataFrame of trades with a parsed ``timestamp`` column.  If the
+        file does not exist or is empty, an empty DataFrame with the expected
+        columns is returned.
+    """
+    if not os.path.exists(TRADE_LOG):
+        # Ensure the DataFrame has the necessary columns even when empty
+        return pd.DataFrame(columns=["timestamp", "price", "rolling_mean", "z_score", "quantity"])
+    trades = pd.read_csv(TRADE_LOG)
+    if trades.empty:
+        return trades
+    # Parse timestamps and drop invalid rows
+    trades["timestamp"] = pd.to_datetime(trades["timestamp"], errors="coerce")
+    trades.dropna(subset=["timestamp"], inplace=True)
+    # Keep only the latest ``max_buffer`` rows
+    return trades.tail(max_buffer).reset_index(drop=True)
 
-trades, anomalies = load_data()
 
-if trades.empty:
-    st.error("No trade data found.")
-    st.stop()
+def load_anomalies() -> pd.DataFrame:
+    """Load anomaly events from ``ANOMALY_LOG``.
 
-trades.sort_values("timestamp", inplace=True)
+    Returns
+    -------
+    pd.DataFrame
+        A DataFrame of anomalies with a parsed ``timestamp`` column.  If the
+        file does not exist or is empty, an empty DataFrame is returned.
+    """
+    if not os.path.exists(ANOMALY_LOG):
+        return pd.DataFrame(columns=["timestamp", "price", "z_score", "quantity", "anomaly_type"])
+    anomalies = pd.read_csv(ANOMALY_LOG)
+    if anomalies.empty:
+        return anomalies
+    anomalies["timestamp"] = pd.to_datetime(anomalies["timestamp"], errors="coerce")
+    anomalies.dropna(subset=["timestamp"], inplace=True)
+    return anomalies.reset_index(drop=True)
 
-# --- Auto-detect anomaly types ---
-anomaly_types = anomalies["anomaly_type"].unique().tolist() if not anomalies.empty else []
-selected_anomalies = st.sidebar.multiselect("Anomaly types to show", anomaly_types, default=anomaly_types)
 
-# --- LIVE MODE ---
-if view_mode == "Live":
-    trades_live = trades.tail(400)
-    time_window = trades_live["timestamp"].min(), trades_live["timestamp"].max()
+def get_anomaly_types(anomalies: pd.DataFrame) -> List[str]:
+    """Return a sorted list of unique anomaly types.
 
-    anomalies_filtered = anomalies[
-        (anomalies["timestamp"] >= time_window[0]) &
-        (anomalies["timestamp"] <= time_window[1]) &
-        (anomalies["anomaly_type"].isin(selected_anomalies))
-    ]
+    Parameters
+    ----------
+    anomalies: pd.DataFrame
+        The anomalies DataFrame.  If empty, an empty list is returned.
 
-    st.subheader("📈 Live Price Chart with Rolling Mean")
-    fig = px.line(
-        trades_live,
-        x="timestamp",
-        y=["price", "rolling_mean"],
-        labels={"value": "Price", "timestamp": "Time"},
-        title="BTC/USDT Price & Rolling Mean"
+    Returns
+    -------
+    List[str]
+        Unique anomaly type names sorted alphabetically.
+    """
+    if anomalies.empty or "anomaly_type" not in anomalies.columns:
+        return []
+    return sorted(anomalies["anomaly_type"].dropna().unique().tolist())
+
+
+def main() -> None:
+    """Entrypoint for the Streamlit dashboard."""
+    # Configure the page before any elements are drawn
+    st.set_page_config(page_title="BTC Anomaly Dashboard", layout="wide")
+    st.title("📊 BTC/USDT Anomaly Detection Dashboard")
+
+    # Sidebar controls
+    st.sidebar.header("Settings")
+    # Users can adjust how frequently the live charts refresh.  The minimum
+    # interval is 1 second and the maximum is 30 seconds.  We cap the default
+    # to ``DEFAULT_REFRESH`` defined above.
+    refresh_rate: int = int(
+        st.sidebar.slider("Auto-refresh interval (seconds)", 1, 30, DEFAULT_REFRESH)
     )
-    fig.update_yaxes(range=[
-        trades_live["price"].min() * 0.998,
-        trades_live["price"].max() * 1.002
-    ])
 
-    marker_styles = {
-        "z_score": {"color": "red", "symbol": "x"},
-        "filtered_isoforest": {"color": "blue", "symbol": "x"},
-        "isolation_forest": {"color": "purple", "symbol": "x"},
-        "z_score_injected": {"color": "orange", "symbol": "star"},
-        "filtered_isoforest_injected": {"color": "gold", "symbol": "star"},
-        "isolation_forest_injected": {"color": "lightgreen", "symbol": "star"}
-    }
+    # Pre-load anomalies once to populate the multiselect.  We don't need to
+    # refresh this list at the fragment rate because anomaly types change
+    # infrequently.  If new anomaly types appear, the user can rerun the app.
+    anomalies_for_filter = load_anomalies()
+    anomaly_types = get_anomaly_types(anomalies_for_filter)
+    selected_types = st.sidebar.multiselect(
+        "Anomaly types to show", anomaly_types, default=anomaly_types
+    )
 
-    for anomaly_type in selected_anomalies:
-        subset = anomalies_filtered[anomalies_filtered["anomaly_type"] == anomaly_type]
-        if not subset.empty:
-            style = marker_styles.get(anomaly_type, {"color": "gray", "symbol": "x"})
-            fig.add_scatter(
-                x=subset["timestamp"],
-                y=subset["price"],
-                mode="markers",
-                name=anomaly_type,
-                marker=dict(
-                    size=10,
-                    symbol=style["symbol"],
-                    color=style["color"]
-                ),
-                customdata=subset[["z_score", "anomaly_type"]],
-                hovertemplate="Time: %{x}<br>Price: %{y:.2f}<br>Z-score: %{customdata[0]:.2f}<br>Type: %{customdata[1]}"
+    st.sidebar.header("Downloads")
+    # We populate the download buttons after the first fragment run using
+    # session state.  If the user loads the page for the first time and clicks
+    # download before the fragment runs, no file will be offered.
+    if "trades" in st.session_state and not st.session_state["trades"].empty:
+        csv = st.session_state["trades"].to_csv(index=False).encode("utf-8")
+        st.sidebar.download_button(
+            "Download Trades CSV",
+            csv,
+            file_name="trades.csv",
+            mime="text/csv",
+        )
+    if "anomalies" in st.session_state and not st.session_state["anomalies"].empty:
+        csv_anom = st.session_state["anomalies"].to_csv(index=False).encode("utf-8")
+        st.sidebar.download_button(
+            "Download Anomalies CSV",
+            csv_anom,
+            file_name="anomalies.csv",
+            mime="text/csv",
+        )
+
+    # -------------------------------------------------------------------------
+    # Define the fragment that loads data and updates the charts
+    #
+    # We decorate the ``update_charts`` function with ``@st.fragment``.  The
+    # ``run_every`` argument tells Streamlit to rerun only this function at
+    # ``refresh_rate`` second intervals while the session is active【551314107550257†L180-L186】.  All
+    # other elements on the page remain static between fragment reruns.  This
+    # prevents the whole page from flashing or showing a spinner when new data
+    # arrives.
+    @st.fragment(run_every=refresh_rate)
+    def update_charts() -> None:
+        # Read the latest trades and anomalies from disk
+        trades = load_recent_trades(MAX_BUFFER)
+        anomalies = load_anomalies()
+
+        # Save to session state so the download buttons outside the fragment
+        # have access to the most recent data
+        st.session_state.trades = trades
+        st.session_state.anomalies = anomalies
+
+        # Price chart with rolling mean
+        st.subheader("📈 BTC/USDT Price with Rolling Mean")
+        if not trades.empty:
+            fig_price = px.line(
+                trades,
+                x="timestamp",
+                y=["price", "rolling_mean"],
+                labels={"value": "Price", "timestamp": "Time"},
+                title="Live Price Chart",
             )
+            fig_price.update_layout(
+                height=350, xaxis_tickformat="%H:%M:%S", template="plotly_white"
+            )
+            st.plotly_chart(fig_price, use_container_width=True)
+        else:
+            st.info("No trade data available.")
 
-    st.plotly_chart(fig, use_container_width=True)
+        # Z-score line chart
+        st.subheader("📉 Z-Score Over Time")
+        if not trades.empty and "z_score" in trades.columns:
+            fig_zscore = px.line(
+                trades,
+                x="timestamp",
+                y="z_score",
+                labels={"z_score": "Z-score", "timestamp": "Time"},
+                title="Z-Score Trend",
+            )
+            fig_zscore.update_layout(
+                height=250, xaxis_tickformat="%H:%M:%S", template="plotly_white"
+            )
+            st.plotly_chart(fig_zscore, use_container_width=True)
+        else:
+            st.info("Z-score data not available in trades.")
 
-    st.subheader("📉 Z-Score Trend")
-    st.line_chart(trades_live.set_index("timestamp")[["z_score"]])
+        # Filter anomalies to the last 60 minutes and selected types
+        st.subheader("🚨 Anomalies in Last 60 Minutes")
+        now = datetime.utcnow()
+        recent_window = now - timedelta(minutes=60)
 
-    if not anomalies_filtered.empty:
-        st.subheader("🚨 Recent Detected Anomalies")
-        st.dataframe(anomalies_filtered.tail(20), use_container_width=True)
-
-        # === NEW: Persistent Anomaly Chart ===
-        st.subheader("🛰 Persistent Anomaly Markers (last 60 minutes)")
-        anomaly_window = pd.Timestamp.utcnow() - pd.Timedelta(minutes=60)
-        recent_anomalies = anomalies[
-            (anomalies["timestamp"] >= anomaly_window) &
-            (anomalies["anomaly_type"].isin(selected_anomalies))
-        ].copy()
+        if not anomalies.empty:
+            recent_anomalies = anomalies[
+                (anomalies["timestamp"] >= recent_window)
+                & (anomalies["anomaly_type"].isin(selected_types))
+            ]
+        else:
+            recent_anomalies = pd.DataFrame()
 
         if not recent_anomalies.empty:
-            anomaly_chart = px.scatter(
+            fig_anom = px.scatter(
                 recent_anomalies,
                 x="timestamp",
                 y="price",
                 color="anomaly_type",
-                title="Persistent Anomaly Timeline",
                 symbol="anomaly_type",
-                hover_data=["z_score", "quantity", "anomaly_type"]
+                hover_data=["z_score", "quantity"],
+                title="Persistent Anomalies (Last 60 min)",
             )
-            st.plotly_chart(anomaly_chart, use_container_width=True)
+            fig_anom.update_layout(
+                height=300, xaxis_tickformat="%H:%M:%S", template="plotly_white"
+            )
+            st.plotly_chart(fig_anom, use_container_width=True)
+            # Show the last 20 anomalies in a table
+            st.dataframe(recent_anomalies.tail(20), use_container_width=True)
         else:
-            st.info("No persistent anomalies in the past hour.")
+            st.info("✅ No anomalies detected in the last 60 minutes.")
 
-        def convert_df(df):
-            return df.to_csv(index=False).encode("utf-8")
+    # Call the fragment function.  Because the ``run_every`` parameter is
+    # specified in the decorator, simply calling the function will schedule
+    # periodic reruns at the given interval.  When the user changes
+    # ``refresh_rate`` via the slider, the script is rerun and the fragment
+    # redecorated with the new interval.
+    update_charts()
 
-        st.download_button("⬇️ Download Anomalies CSV", convert_df(anomalies), "anomalies.csv", "text/csv")
-        st.download_button("⬇️ Download Trades CSV", convert_df(trades), "trades.csv", "text/csv")
 
-
-    if auto_refresh:
-        st_autorefresh(interval=refresh_rate * 1000, key="refresh")
-
-# --- HISTORICAL MODE (unchanged) ---
-if view_mode == "Historical":
-    trades_historical = trades.copy()
-    trades_historical["timestamp"] = pd.to_datetime(
-        trades_historical["timestamp"], format='mixed', errors='coerce'
-    )
-    trades_historical.dropna(subset=["timestamp"], inplace=True)
-    trades_historical.set_index("timestamp", inplace=True)
-
-    rule = "1H" if interval == "Hourly" else "1D"
-    grouped = trades_historical.resample(rule).agg({
-        "price": "mean",
-        "quantity": "sum",
-        "z_score": "mean"
-    }).dropna()
-
-    st.subheader(f"⏳ {interval} Price Trend")
-    st.line_chart(grouped[["price"]])
-
-    st.subheader(f"📉 {interval} Z-Score Trend")
-    st.line_chart(grouped[["z_score"]])
-
-    st.subheader(f"📦 {interval} Volume")
-    st.bar_chart(grouped[["quantity"]])
+if __name__ == "__main__":
+    main()
