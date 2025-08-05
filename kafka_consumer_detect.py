@@ -1,219 +1,98 @@
-"""
-Enhanced Kafka Consumer with improved stability and consistent CSV format
-"""
-
 from kafka import KafkaConsumer
-from kafka.errors import KafkaError
+# Import the database manager to persist trades and anomalies
+try:
+    from database_manager import DatabaseManager
+    # Initialize a single DatabaseManager instance
+    db = DatabaseManager()
+    USE_DATABASE = True
+except Exception as e:
+    # If the database module cannot be imported, fall back to CSV logging
+    print(f"Warning: Could not import DatabaseManager ({e}). Falling back to CSV logs.")
+    db = None
+    USE_DATABASE = False
 import json
 import pandas as pd
 import numpy as np
 from datetime import datetime
 import time
 from sklearn.ensemble import IsolationForest
-from sklearn.neighbors import LocalOutlierFactor
-from sklearn.svm import OneClassSVM
-from sklearn.preprocessing import StandardScaler
 import joblib
 import os
-import warnings
-import traceback
-import signal
-import sys
-
-warnings.filterwarnings('ignore')
-
-# Import our new modules with error handling
-try:
-    from evaluation_metrics import AnomalyEvaluator
-    from alert_manager import AlertManager
-    from database_manager import DatabaseManager
-    HAS_MODULES = True
-except ImportError as e:
-    print(f"Warning: Some modules not available: {e}")
-    HAS_MODULES = False
 
 # --- Configs ---
 KAFKA_TOPIC = "crypto_trades"
 KAFKA_BROKER = "localhost:9092"
 ROLLING_WINDOW = 650
 Z_THRESHOLD = 3
+MODEL_PATH = "model_isoforest.pkl"
+BEST_MODEL_PATH = "model_isoforest_best.pkl"
 RETRAIN_INTERVAL = 100
 
-# File paths
+# Paths for CSV logs (used only when database logging is unavailable)
 TRADE_LOG = "trades.csv"
 ANOMALY_LOG = "anomalies.csv"
-MODEL_DIR = "models"
 SLEEP = False
 
-# CSV columns to maintain consistency
-TRADE_CSV_COLUMNS = [
-    'timestamp', 'price', 'quantity', 'is_buyer_maker',
-    'z_score', 'rolling_mean', 'rolling_std',
-    'price_change_pct', 'time_gap_sec', 'injected'
-]
+# --- Initialize model ---
+buffer_for_training = []
+counter = 0
+is_model_fitted = False
 
-ANOMALY_CSV_COLUMNS = [
-    'timestamp', 'price', 'quantity', 'z_score',
-    'anomaly_type', 'model_votes'
-]
+if os.path.exists(BEST_MODEL_PATH):
+    model = joblib.load(BEST_MODEL_PATH)
+    is_model_fitted = True
+    print("🌟 Loaded auto-tuned Isolation Forest model.")
+elif os.path.exists(MODEL_PATH):
+    model = joblib.load(MODEL_PATH)
+    is_model_fitted = True
+    print("📦 Loaded base Isolation Forest model.")
+else:
+    model = IsolationForest(n_estimators=100, contamination=0.01, random_state=42)
+    print("🧪 Initialized new Isolation Forest model (untrained).")
 
-# Create model directory if not exists
-os.makedirs(MODEL_DIR, exist_ok=True)
+# --- Kafka Consumer ---
+consumer = KafkaConsumer(
+    KAFKA_TOPIC,
+    bootstrap_servers=KAFKA_BROKER,
+    auto_offset_reset='latest',
+    value_deserializer=lambda x: json.loads(x.decode('utf-8'))
+)
 
-# --- Initialize components with error handling ---
-db = None
-alert_manager = None
-evaluator = None
+# --- Rolling history storage ---
+history_df = pd.DataFrame(columns=['timestamp', 'price', 'quantity', 'is_buyer_maker'])
 
-if HAS_MODULES:
-    try:
-        db = DatabaseManager()
-    except Exception as e:
-        print(f"Warning: Database initialization failed: {e}")
-        db = None
-
-    try:
-        alert_manager = AlertManager("alert_config.json")
-    except Exception as e:
-        print(f"Warning: Alert manager initialization failed: {e}")
-        alert_manager = None
-
-    try:
-        evaluator = AnomalyEvaluator(window_minutes=60)
-    except Exception as e:
-        print(f"Warning: Evaluator initialization failed: {e}")
-        evaluator = None
-
-# Global flag for graceful shutdown
-shutdown_flag = False
-
-def signal_handler(sig, frame):
-    """Handle shutdown signals gracefully"""
-    global shutdown_flag
-    print('\n🛑 Shutdown signal received. Closing gracefully...')
-    shutdown_flag = True
-
-# Register signal handlers
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
-
-# --- Model Ensemble Class ---
-class AnomalyEnsemble:
-    def __init__(self):
-        self.models = {}
-        self.scaler = StandardScaler()
-        self.is_fitted = False
-        self.voting_threshold = 0.5
-
-        # Initialize models
-        self.models['isolation_forest'] = IsolationForest(
-            n_estimators=150,
-            contamination=0.01,
-            random_state=42,
-            n_jobs=-1
-        )
-
-        self.models['lof'] = LocalOutlierFactor(
-            n_neighbors=20,
-            contamination=0.01,
-            novelty=True,
-            n_jobs=-1
-        )
-
-        self.models['one_class_svm'] = OneClassSVM(
-            kernel='rbf',
-            gamma='auto',
-            nu=0.01
-        )
-
-    def fit(self, X):
-        """Fit all models in the ensemble"""
+# Warm up the history using the last ROLLING_WINDOW trades.
+# Prefer loading from the database if available; otherwise fall back to CSV.
+try:
+    if USE_DATABASE and db is not None:
         try:
-            X_scaled = self.scaler.fit_transform(X)
-
-            for name, model in self.models.items():
-                try:
-                    model.fit(X_scaled)
-                    print(f"✓ {name} fitted successfully")
-                except Exception as e:
-                    print(f"✗ Error fitting {name}: {e}")
-
-            self.is_fitted = True
+            # Fetch the most recent ROLLING_WINDOW trades from the DB
+            recent_trades = db.get_recent_trades(minutes=24 * 60, limit=ROLLING_WINDOW)
+            if not recent_trades.empty:
+                history_df = recent_trades[['timestamp', 'price', 'quantity', 'is_buyer_maker']].copy()
+                history_df['price'] = history_df['price'].astype(float)
+                history_df['quantity'] = history_df['quantity'].astype(float)
+                history_df['is_buyer_maker'] = history_df['is_buyer_maker'].astype(int)
+                print(f"📊 Loaded {len(history_df)} historical trades from DB for warm start")
         except Exception as e:
-            print(f"Error in ensemble fit: {e}")
-            self.is_fitted = False
+            # If DB read fails, fall back to CSV
+            print(f"Could not load historical data from DB: {e}")
 
-    def predict(self, X):
-        """Get ensemble prediction using voting"""
-        if not self.is_fitted:
-            return 1
+    if history_df.empty and os.path.exists(TRADE_LOG):
+        # Load last N trades from CSV to initialize history
+        existing_trades = pd.read_csv(TRADE_LOG)
+        if not existing_trades.empty:
+            # Take last ROLLING_WINDOW trades
+            history_df = existing_trades[['timestamp', 'price', 'quantity', 'is_buyer_maker']].tail(ROLLING_WINDOW).copy()
+            history_df['price'] = history_df['price'].astype(float)
+            history_df['quantity'] = history_df['quantity'].astype(float)
+            history_df['is_buyer_maker'] = history_df['is_buyer_maker'].astype(int)
+            print(f"📊 Loaded {len(history_df)} historical trades from CSV for warm start")
+except Exception as e:
+    print(f"Could not load historical data: {e}")
+    history_df = pd.DataFrame(columns=['timestamp', 'price', 'quantity', 'is_buyer_maker'])
 
-        try:
-            X_scaled = self.scaler.transform(X.reshape(1, -1))
-            votes = []
 
-            for name, model in self.models.items():
-                try:
-                    # Convert numpy int64 to regular Python int
-                    pred = int(model.predict(X_scaled)[0])
-                    votes.append(1 if pred == -1 else 0)
-                except:
-                    votes.append(0)
-
-            anomaly_ratio = sum(votes) / len(votes) if votes else 0
-            return -1 if anomaly_ratio >= self.voting_threshold else 1
-        except Exception as e:
-            print(f"Error in ensemble predict: {e}")
-            return 1
-
-    def get_model_predictions(self, X):
-        """Get individual model predictions for analysis"""
-        if not self.is_fitted:
-            return {}
-
-        try:
-            X_scaled = self.scaler.transform(X.reshape(1, -1))
-            predictions = {}
-
-            for name, model in self.models.items():
-                try:
-                    # Convert numpy int64 to regular Python int
-                    pred = model.predict(X_scaled)[0]
-                    predictions[name] = int(pred)  # Convert to Python int
-                except:
-                    predictions[name] = 1
-
-            return predictions
-        except Exception as e:
-            print(f"Error getting model predictions: {e}")
-            return {}
-
-    def save(self, base_path):
-        """Save all models and scaler"""
-        try:
-            joblib.dump(self.scaler, os.path.join(base_path, "ensemble_scaler.pkl"))
-            for name, model in self.models.items():
-                joblib.dump(model, os.path.join(base_path, f"ensemble_{name}.pkl"))
-        except Exception as e:
-            print(f"Error saving models: {e}")
-
-    def load(self, base_path):
-        """Load saved models if they exist"""
-        try:
-            scaler_path = os.path.join(base_path, "ensemble_scaler.pkl")
-            if os.path.exists(scaler_path):
-                self.scaler = joblib.load(scaler_path)
-                self.is_fitted = True
-
-            for name in self.models.keys():
-                model_path = os.path.join(base_path, f"ensemble_{name}.pkl")
-                if os.path.exists(model_path):
-                    self.models[name] = joblib.load(model_path)
-                    print(f"📦 Loaded {name} from disk")
-        except Exception as e:
-            print(f"Error loading models: {e}")
-
-# --- Enhanced Feature Computation ---
 def compute_features(trade, history_df):
     """Compute features with proper history management"""
     try:
@@ -251,8 +130,7 @@ def compute_features(trade, history_df):
         if history_length > 1:
             # Price change features
             prev_price = float(history_df.iloc[-2]['price'])
-            features['price_change_pct'] = ((features[
-                                                 'price'] - prev_price) / prev_price) * 100 if prev_price > 0 else 0
+            features['price_change_pct'] = ((features['price'] - prev_price) / prev_price) * 100 if prev_price > 0 else 0
 
             # Time gap features
             try:
@@ -404,347 +282,93 @@ def compute_features(trade, history_df):
         }, history_df
 
 def log_trade(features):
-    """Log to both CSV and database with error handling"""
-    trade_id = None
-
-    # Database insert
-    if db is not None:
+    """
+    Persist a trade either to the database (preferred) or to CSV as a fallback.
+    Returns the trade_id if using the database.
+    """
+    if USE_DATABASE and db is not None:
         try:
-            trade_id = db.insert_trade(features)
+            return db.insert_trade(features)
         except Exception as e:
-            print(f"Database insert error: {e}")
+            # If database insertion fails, fall back to CSV logging
+            print(f"Database trade insertion failed: {e}. Falling back to CSV.")
+    # CSV fallback
+    pd.DataFrame([features]).to_csv(
+        TRADE_LOG,
+        mode='a',
+        header=not os.path.exists(TRADE_LOG),
+        index=False
+    )
+    return None
 
-    # CSV logging - only selected columns for consistency
-    try:
-        csv_data = {col: features.get(col, 0) for col in TRADE_CSV_COLUMNS}
-        pd.DataFrame([csv_data]).to_csv(
-            TRADE_LOG,
-            mode='a',
-            header=not os.path.exists(TRADE_LOG),
-            index=False,
-            columns=TRADE_CSV_COLUMNS  # Ensure column order
-        )
-    except Exception as e:
-        print(f"CSV logging error: {e}")
+def log_anomaly(trade_id, features, method):
+    """
+    Persist an anomaly either to the database (preferred) or to CSV as a fallback.
+    Accepts the associated trade_id when available.
+    """
+    record = features.copy()
+    # Determine anomaly type, appending '_injected' for synthetic anomalies
+    anomaly_type = method + "_injected" if record.get('injected') else method
+    record['anomaly_type'] = anomaly_type
 
-    return trade_id
+    if USE_DATABASE and db is not None and trade_id is not None:
+        try:
+            # Insert anomaly into the database
+            return db.insert_anomaly(trade_id, record, anomaly_type)
+        except Exception as e:
+            # If database insertion fails, fall back to CSV logging
+            print(f"Database anomaly insertion failed: {e}. Falling back to CSV.")
 
+    # CSV fallback
+    pd.DataFrame([record]).to_csv(
+        ANOMALY_LOG,
+        mode='a',
+        header=not os.path.exists(ANOMALY_LOG),
+        index=False
+    )
+    return None
 
-# Add this function near the top of your kafka_consumer_detect.py file, after imports
+# --- Main loop ---
+print("🚀 Kafka Consumer started. Waiting for messages...")
 
-def convert_numpy_types(obj):
-    """Convert numpy types to Python native types for JSON serialization"""
-    if isinstance(obj, np.integer):
-        return int(obj)
-    elif isinstance(obj, np.floating):
-        return float(obj)
-    elif isinstance(obj, np.ndarray):
-        return obj.tolist()
-    elif isinstance(obj, dict):
-        return {key: convert_numpy_types(value) for key, value in obj.items()}
-    elif isinstance(obj, list):
-        return [convert_numpy_types(item) for item in obj]
-    else:
-        return obj
+for message in consumer:
+    trade = message.value
+    features, history_df = compute_features(trade, history_df)
 
+    print(f"[{features['timestamp']}] Price: {features['price']} | Z: {features.get('z_score', 0):.2f} | Δ%: {features.get('price_change_pct', 0):.2f} | Δt: {features.get('time_gap_sec', 0)}s")
+    # Persist the trade and capture the returned trade_id when using the database
+    trade_id = log_trade(features)
 
-# Then update the log_anomaly function to use this helper:
-def log_anomaly(trade_id, features, method, model_details=None):
-    """Log anomaly with error handling"""
-    try:
-        # Convert any numpy types in model_details
-        if model_details:
-            model_details = convert_numpy_types(model_details)
+    if len(history_df) < ROLLING_WINDOW:
+        continue
 
-        # Determine severity
-        severity = 'medium'
-        if alert_manager is not None:
-            severity = alert_manager.determine_severity(features)
+    z_score_flag = abs(features['z_score']) > Z_THRESHOLD
+    if z_score_flag:
+        print("🚨 Z-Score Anomaly Detected!")
+        log_anomaly(trade_id, features, "z_score")
 
-        # Database insert
-        if db is not None and trade_id is not None:
-            try:
-                anomaly_id = db.insert_anomaly(trade_id, features, method, model_details, severity)
-            except Exception as e:
-                print(f"Database anomaly insert error: {e}")
+    data_point = [
+        features['z_score'],
+        features['price_change_pct'],
+        features['time_gap_sec']
+    ]
+    buffer_for_training.append(data_point)
+    counter += 1
 
-        # Send alert
-        if alert_manager is not None:
-            anomaly_data = features.copy()
-            anomaly_data['anomaly_type'] = method
-            if model_details:
-                anomaly_data['model_votes'] = model_details
+    if len(buffer_for_training) > ROLLING_WINDOW:
+        recent_data = np.array(buffer_for_training[-ROLLING_WINDOW:])
 
-            try:
-                alert_manager.send_alert(anomaly_data, severity)
-            except Exception as e:
-                print(f"Alert sending error: {e}")
+        if counter % RETRAIN_INTERVAL == 0:
+            model.fit(recent_data)
+            joblib.dump(model, MODEL_PATH)
+            is_model_fitted = True
+            print("🔄 Isolation Forest model retrained.")
 
-        # CSV logging - only selected columns
-        csv_data = {
-            'timestamp': features.get('timestamp', ''),
-            'price': features.get('price', 0),
-            'quantity': features.get('quantity', 0),
-            'z_score': features.get('z_score', 0),
-            'anomaly_type': method + "_injected" if features.get('injected') else method,
-            'model_votes': json.dumps(model_details) if model_details else ''
-        }
+        if is_model_fitted:
+            pred = model.predict([data_point])[0]
+            if pred == -1 and z_score_flag:
+                print("🚨 Isolation Forest Anomaly Detected (filtered)!")
+                log_anomaly(trade_id, features, "filtered_isoforest")
 
-        pd.DataFrame([csv_data]).to_csv(
-            ANOMALY_LOG,
-            mode='a',
-            header=not os.path.exists(ANOMALY_LOG),
-            index=False,
-            columns=ANOMALY_CSV_COLUMNS
-        )
-    except Exception as e:
-        print(f"Error logging anomaly: {e}")
-
-# --- Initialize with error handling ---
-print("🚀 Starting Enhanced Kafka Consumer...")
-
-# Initialize ensemble
-try:
-    ensemble = AnomalyEnsemble()
-    ensemble.load(MODEL_DIR)
-except Exception as e:
-    print(f"Error initializing ensemble: {e}")
-    ensemble = AnomalyEnsemble()
-
-buffer_for_training = []
-counter = 0
-last_save_time = time.time()
-
-# Initialize Kafka Consumer with retry logic
-consumer = None
-retry_count = 0
-max_retries = 5
-
-while retry_count < max_retries and not shutdown_flag:
-    try:
-        consumer = KafkaConsumer(
-            KAFKA_TOPIC,
-            bootstrap_servers=KAFKA_BROKER,
-            auto_offset_reset='latest',
-            value_deserializer=lambda x: json.loads(x.decode('utf-8')),
-            consumer_timeout_ms=1000,  # 1 second timeout for checking shutdown
-            session_timeout_ms=30000,
-            heartbeat_interval_ms=10000,
-            max_poll_records=10,
-            enable_auto_commit=True,
-            auto_commit_interval_ms=5000
-        )
-        print(f"✅ Connected to Kafka broker: {KAFKA_BROKER}")
-        break
-    except Exception as e:
-        retry_count += 1
-        print(f"❌ Failed to connect to Kafka (attempt {retry_count}/{max_retries}): {e}")
-        if retry_count < max_retries:
-            time.sleep(5)
-        else:
-            print("Failed to connect to Kafka after max retries. Exiting.")
-            sys.exit(1)
-
-# Rolling history storage
-history_df = pd.DataFrame()
-
-# Print initialization status
-print(f"📊 Models in ensemble: {list(ensemble.models.keys())}")
-if db:
-    print(f"💾 Database: {db.db_path}")
-if alert_manager:
-    enabled_channels = [k for k, v in alert_manager.config.items() if v.get('enabled', False)]
-    print(f"🔔 Alerts: Configured channels - {enabled_channels}")
-
-# --- Main loop with error handling ---
-print("Starting main processing loop...")
-
-while not shutdown_flag:
-    try:
-        # Poll for messages
-        messages = consumer.poll(timeout_ms=1000)
-
-        if not messages:
-            continue
-
-        for topic_partition, records in messages.items():
-            for message in records:
-                try:
-                    trade = message.value
-                    features, history_df = compute_features(trade, history_df)
-
-                    print(f"[{features['timestamp']}] Price: ${features['price']:.2f} | "
-                          f"Z: {features['z_score']:.2f} | Vol: {features['quantity']:.4f}")
-
-                    # Log trade and get ID
-                    trade_id = log_trade(features)
-
-                    if len(history_df) < ROLLING_WINDOW:
-                        continue
-
-                    # Track if this is an injected anomaly (ground truth)
-                    is_actual_anomaly = bool(features.get('injected', False))
-                    if is_actual_anomaly and evaluator is not None:
-                        evaluator.add_ground_truth(features['timestamp'], True)
-
-                    # Statistical anomaly detection
-                    statistical_anomalies = []
-                    statistical_detected = False
-
-                    if abs(features['z_score']) > Z_THRESHOLD:
-                        statistical_anomalies.append("z_score")
-                        statistical_detected = True
-                    if abs(features.get('vwap_deviation', 0)) > 2.0:
-                        statistical_anomalies.append("vwap")
-                        statistical_detected = True
-                    if features.get('volume_spike', 1) > 3.0:
-                        statistical_anomalies.append("volume")
-                        statistical_detected = True
-
-                    # Record detection for evaluation
-                    if evaluator is not None:
-                        if statistical_detected:
-                            print(f"📊 Statistical anomalies: {', '.join(statistical_anomalies)}")
-                            log_anomaly(trade_id, features, "_".join(statistical_anomalies))
-
-                            confidence = max(
-                                abs(features['z_score']) / Z_THRESHOLD,
-                                abs(features.get('vwap_deviation', 0)) / 2.0,
-                                features.get('volume_spike', 1) / 3.0
-                            ) / 2
-
-                            evaluator.record_detection(
-                                features['timestamp'],
-                                'statistical',
-                                True,
-                                min(confidence, 1.0),
-                                is_actual_anomaly
-                            )
-                        else:
-                            evaluator.record_detection(
-                                features['timestamp'],
-                                'statistical',
-                                False,
-                                0.0,
-                                is_actual_anomaly
-                            )
-
-                    # ML-based detection
-                    feature_vector = np.array([
-                        features.get('z_score', 0),
-                        features.get('price_change_pct', 0),
-                        features.get('time_gap_sec', 0),
-                        features.get('volume_ratio', 1),
-                        features.get('buy_pressure', 0.5),
-                        features.get('vwap_deviation', 0),
-                        features.get('price_velocity', 0),
-                        features.get('volume_spike', 1)
-                    ])
-
-                    buffer_for_training.append(feature_vector)
-                    counter += 1
-
-                    # ML detection
-                    if len(buffer_for_training) > ROLLING_WINDOW:
-                        recent_data = np.array(buffer_for_training[-ROLLING_WINDOW:])
-
-                        # Retrain periodically
-                        if counter % RETRAIN_INTERVAL == 0:
-                            print("🔄 Retraining ensemble models...")
-                            ensemble.fit(recent_data)
-                            ensemble.save(MODEL_DIR)
-
-                            # Generate evaluation report
-                            if evaluator is not None:
-                                print("\n📊 Current Model Performance:")
-                                print(evaluator.generate_report())
-                                evaluator.save_summary()
-
-                                # Save to database
-                                if db is not None:
-                                    metrics = evaluator.get_metrics()
-                                    for model_name, model_metrics in metrics.items():
-                                        try:
-                                            db.save_model_performance(model_name, model_metrics)
-                                        except Exception as e:
-                                            print(f"Error saving model performance: {e}")
-
-                        if ensemble.is_fitted:
-                            # Get predictions
-                            ensemble_pred = ensemble.predict(feature_vector)
-
-                            if ensemble_pred == -1:
-                                model_predictions = ensemble.get_model_predictions(feature_vector)
-
-                                # Calculate confidence
-                                anomaly_votes = sum(1 for pred in model_predictions.values() if pred == -1)
-                                confidence = anomaly_votes / len(model_predictions) if model_predictions else 0
-
-                                print(f"🤖 ML Ensemble Anomaly Detected!")
-                                print(f"   Model votes: {model_predictions}")
-                                print(f"   Confidence: {confidence:.2f}")
-
-                                # Log anomaly
-                                log_anomaly(trade_id, features, "ensemble_ml", model_predictions)
-
-                                # Record for evaluation
-                                if evaluator is not None:
-                                    evaluator.record_detection(
-                                        features['timestamp'],
-                                        'ensemble_ml',
-                                        True,
-                                        confidence,
-                                        is_actual_anomaly
-                                    )
-
-                    # Generate plots periodically
-                    if counter % 1000 == 0:
-                        if evaluator is not None:
-                            print("\n📈 Generating performance plots...")
-                            try:
-                                evaluator.plot_performance(f"evaluation_plots_{counter}.png")
-                            except Exception as e:
-                                print(f"Error generating plots: {e}")
-
-                        # Print database statistics
-                        if db is not None:
-                            try:
-                                stats = db.get_statistics(24)
-                                print(f"\nDatabase statistics (last 24h):")
-                                print(f"  Total trades: {stats['total_trades']}")
-                                print(f"  Total anomalies: {stats['total_anomalies']}")
-                                print(f"  Anomaly rate: {stats['anomaly_rate']:.2%}")
-                            except Exception as e:
-                                print(f"Error getting database stats: {e}")
-
-                    # Periodic cleanup of old data
-                    if time.time() - last_save_time > 3600:  # Every hour
-                        if db is not None:
-                            try:
-                                db.cleanup_old_data(days_to_keep=7)
-                                print("🧹 Cleaned up old data")
-                            except Exception as e:
-                                print(f"Error during cleanup: {e}")
-                        last_save_time = time.time()
-
-                    if SLEEP:
-                        time.sleep(0.1)
-
-                except Exception as e:
-                    print(f"Error processing message: {e}")
-                    traceback.print_exc()
-                    continue
-
-    except Exception as e:
-        if shutdown_flag:
-            break
-        print(f"Error in main loop: {e}")
-        traceback.print_exc()
-        time.sleep(1)  # Brief pause before retrying
-
-# Cleanup
-print("\n🧹 Cleaning up...")
-if consumer is not None:
-    consumer.close()
-print("✅ Consumer closed successfully")
-print("👋 Goodbye!")
+    if SLEEP:
+        time.sleep(0.1)

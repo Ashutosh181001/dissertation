@@ -54,7 +54,12 @@ def load_recent_trades(max_buffer: int) -> pd.DataFrame:
     if not os.path.exists(TRADE_LOG):
         return pd.DataFrame(columns=["timestamp", "price", "rolling_mean", "z_score", "quantity"])
 
-    trades = pd.read_csv(TRADE_LOG)
+    # Read trades CSV, skipping malformed rows if necessary
+    try:
+        trades = pd.read_csv(TRADE_LOG)
+    except pd.errors.ParserError:
+        # When the CSV has inconsistent columns (e.g. old and new formats mixed), skip bad lines
+        trades = pd.read_csv(TRADE_LOG, engine='python', on_bad_lines='skip')
     if trades.empty:
         return trades
 
@@ -87,7 +92,11 @@ def load_anomalies() -> pd.DataFrame:
     if not os.path.exists(ANOMALY_LOG):
         return pd.DataFrame(columns=["timestamp", "price", "z_score", "quantity", "anomaly_type"])
 
-    anomalies = pd.read_csv(ANOMALY_LOG)
+    # Read anomalies CSV, skipping malformed rows if necessary
+    try:
+        anomalies = pd.read_csv(ANOMALY_LOG)
+    except pd.errors.ParserError:
+        anomalies = pd.read_csv(ANOMALY_LOG, engine='python', on_bad_lines='skip')
     if anomalies.empty:
         return anomalies
 
