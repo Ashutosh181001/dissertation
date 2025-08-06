@@ -79,18 +79,15 @@ MAX_BUFFER = 400
 def log_message(logs: List[str], message: str) -> None:
     """Append a message to the log list with a timestamp.
 
-    Parameters
-    ----------
-    logs : list
-        A list of strings to which the message will be appended.
-    message : str
-        The message to append.
+    Logging is internal to this module.  No log output is displayed in the user
+    interface.  This helper exists solely for debugging during
+    development.
     """
     timestamp = datetime.utcnow().strftime("%H:%M:%S")
     logs.append(f"[{timestamp}] {message}")
 
 
-def load_trades(minutes: int, logs: List[str]) -> pd.DataFrame:
+def load_trades(minutes: int, logs: List[str], allow_fallback: bool = True) -> pd.DataFrame:
     """Load trades from the database or CSV within the last `minutes`.
 
     This function attempts to load trades from the configured database
@@ -155,9 +152,9 @@ def load_trades(minutes: int, logs: List[str]) -> pd.DataFrame:
                 return trades
         except Exception as e:
             log_message(logs, f"CSV trade load error: {e}")
-    # If nothing found, attempt a broader fallback similar to the legacy dashboard.
+    # If nothing found and fallback is allowed, attempt a broader fallback similar to the legacy dashboard.
     # Try retrieving a fixed number of recent trades from the database or CSV.
-    if USE_DATABASE and db is not None:
+    if allow_fallback and USE_DATABASE and db is not None:
         try:
             fallback_df = db.get_recent_trades(minutes=60, limit=MAX_BUFFER)
             if fallback_df is not None and not fallback_df.empty:
@@ -174,7 +171,7 @@ def load_trades(minutes: int, logs: List[str]) -> pd.DataFrame:
         except Exception as e:
             log_message(logs, f"Database fallback error: {e}")
     # CSV fallback for recent trades
-    if os.path.exists(TRADE_LOG):
+    if allow_fallback and os.path.exists(TRADE_LOG):
         try:
             trades = pd.read_csv(TRADE_LOG)
             if not trades.empty:
@@ -191,7 +188,7 @@ def load_trades(minutes: int, logs: List[str]) -> pd.DataFrame:
                 return trades
         except Exception as e:
             log_message(logs, f"CSV fallback error: {e}")
-    # If still no data, log and return empty
+    # If still no data or fallback not allowed, log and return empty
     log_message(logs, "No trades available")
     return df
 
@@ -327,6 +324,25 @@ def load_database_stats() -> Dict:
     return {}
 
 
+def get_latest_trade_price() -> Optional[float]:
+    """Return the most recent trade price available from the data source.
+
+    This helper queries the data source for a small window (10 minutes) with
+    fallback enabled.  If at least one trade is present it returns the
+    latest price; otherwise it returns None.  This allows the dashboard to
+    display a current price that reflects the most recent trade regardless
+    of the selected time interval.
+    """
+    dummy_logs: List[str] = []
+    df_latest = load_trades(minutes=10, logs=dummy_logs, allow_fallback=True)
+    if not df_latest.empty and 'price' in df_latest.columns:
+        try:
+            return float(df_latest['price'].iloc[-1])
+        except Exception:
+            pass
+    return None
+
+
 def create_metrics_row(trades_df: pd.DataFrame, anomalies_df: pd.DataFrame, interval_name: str) -> None:
     """Render a row of key metrics into the Streamlit app.
 
@@ -340,19 +356,27 @@ def create_metrics_row(trades_df: pd.DataFrame, anomalies_df: pd.DataFrame, inte
     # Use five columns for metrics similar to the new prototype
     col1, col2, col3, col4, col5 = st.columns(5)
     try:
+        # Current price is the last price in the selected time window
         current_price = float(trades_df.iloc[-1]['price'])
-        # Price change relative to the first trade in the window
+        # Price change relative to the first trade in the selected window
         first_price = float(trades_df.iloc[0]['price']) if len(trades_df) > 0 else current_price
         price_change = ((current_price - first_price) / first_price) * 100 if first_price != 0 else 0.0
         with col1:
             st.metric("Current Price", f"${current_price:,.2f}", f"{price_change:+.2f}%")
+        # High and low values are computed over the selected window
         high_price = float(trades_df['price'].max())
         low_price = float(trades_df['price'].min())
         with col2:
             st.metric(f"{interval_name} High", f"${high_price:,.2f}")
         with col3:
             st.metric(f"{interval_name} Low", f"${low_price:,.2f}")
-        total_volume = float(trades_df['quantity'].sum())
+        # Volume calculation: prefer raw trade quantities; fall back to precomputed volume if available
+        if 'quantity' in trades_df.columns:
+            total_volume = float(trades_df['quantity'].sum())
+        elif 'volume' in trades_df.columns:
+            total_volume = float(trades_df['volume'].sum())
+        else:
+            total_volume = 0.0
         with col4:
             st.metric(f"{interval_name} Volume", f"{total_volume:.4f} BTC")
         anomaly_count = len(anomalies_df) if not anomalies_df.empty else 0
@@ -546,7 +570,9 @@ def display_interval(interval_name: str, interval_config: Dict[str, Optional[int
     @frag_decorator
     def render_interval() -> None:
         # Load trades and anomalies inside the fragment to update on refresh
-        trades_df = load_trades(minutes, logs)
+        # Only allow fallback to most recent trades for shorter intervals (<= 60 minutes)
+        allow_fallback = minutes <= 60
+        trades_df = load_trades(minutes, logs, allow_fallback=allow_fallback)
         anomalies_df = load_anomalies(minutes, logs, selected_anomaly_types)
         if trades_df.empty:
             st.warning(f"No trade data available for {interval_name}")
@@ -571,44 +597,25 @@ def display_interval(interval_name: str, interval_config: Dict[str, Optional[int
             fallback_fig = px.line(trades_df, x='timestamp', y='price', title=f'BTC/USDT Price - {interval_name}')
             fallback_fig.update_layout(template='plotly_dark')
             st.plotly_chart(fallback_fig, use_container_width=True)
-        # Additional charts: Z-score and Volume in two columns
-        col_z, col_vol = st.columns(2)
-        # Z-score chart
-        with col_z:
-            st.subheader("📉 Z-Score Over Time")
-            if 'z_score' in trades_df.columns and not trades_df['z_score'].isna().all():
-                z_fig = go.Figure()
-                z_fig.add_trace(go.Scatter(
-                    x=trades_df['timestamp'],
-                    y=trades_df['z_score'],
-                    mode='lines',
-                    name='Z-Score',
-                    line=dict(color='#2ca02c', width=2)
-                ))
-                # Threshold lines
-                z_fig.add_hline(y=3, line_dash="dash", line_color="red", annotation_text="Upper", annotation_position="top right")
-                z_fig.add_hline(y=-3, line_dash="dash", line_color="red", annotation_text="Lower", annotation_position="bottom right")
-                z_fig.add_hline(y=0, line_dash="dot", line_color="gray")
-                z_fig.update_layout(height=300, template='plotly_dark', xaxis_title='', yaxis_title='Z-Score')
-                st.plotly_chart(z_fig, use_container_width=True)
-            else:
-                st.info("Z-score data not available.")
-        # Volume chart
-        with col_vol:
-            if show_indicators.get('volume', False):
-                st.subheader("📊 Trading Volume")
-                if 'quantity' in trades_df.columns and not trades_df['quantity'].isna().all():
-                    v_fig = go.Figure()
-                    v_fig.add_trace(go.Bar(
-                        x=trades_df['timestamp'],
-                        y=trades_df['quantity'],
-                        name='Volume',
-                        marker_color='lightblue'
-                    ))
-                    v_fig.update_layout(height=300, template='plotly_dark', xaxis_title='', yaxis_title='Volume')
-                    st.plotly_chart(v_fig, use_container_width=True)
-                else:
-                    st.info("Volume data not available.")
+        # Z-score chart (full width).  The separate volume chart has been removed.
+        st.subheader("📉 Z-Score Over Time")
+        if 'z_score' in trades_df.columns and not trades_df['z_score'].isna().all():
+            z_fig = go.Figure()
+            z_fig.add_trace(go.Scatter(
+                x=trades_df['timestamp'],
+                y=trades_df['z_score'],
+                mode='lines',
+                name='Z-Score',
+                line=dict(color='#2ca02c', width=2)
+            ))
+            # Threshold lines
+            z_fig.add_hline(y=3, line_dash="dash", line_color="red", annotation_text="Upper", annotation_position="top right")
+            z_fig.add_hline(y=-3, line_dash="dash", line_color="red", annotation_text="Lower", annotation_position="bottom right")
+            z_fig.add_hline(y=0, line_dash="dot", line_color="gray")
+            z_fig.update_layout(height=300, template='plotly_dark', xaxis_title='', yaxis_title='Z-Score')
+            st.plotly_chart(z_fig, use_container_width=True)
+        else:
+            st.info("Z-score data not available.")
         # Anomalies table
         if not anomalies_df.empty:
             st.subheader("🚨 Recent Anomalies")
@@ -623,17 +630,7 @@ def display_interval(interval_name: str, interval_config: Dict[str, Optional[int
             display_df.columns = ['Timestamp', 'Type', 'Price', 'Z-Score']
             display_df = display_df.head(20)
             st.dataframe(display_df, use_container_width=True)
-        # Data information and last update
-        with st.expander("📊 Data Information", expanded=False):
-            c1, c2 = st.columns(2)
-            with c1:
-                st.write(f"**Trades loaded:** {len(trades_df)}")
-                if not trades_df.empty:
-                    st.write(f"**Time range:** {trades_df['timestamp'].min()} to {trades_df['timestamp'].max()}")
-            with c2:
-                st.write(f"**Anomalies:** {len(anomalies_df)}")
-                if not anomalies_df.empty:
-                    st.write(f"**Anomaly types:** {', '.join(anomalies_df['anomaly_type'].unique())}")
+        # Last update timestamp
         st.caption(f"Last updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
     # Call the fragment function to render the content
     render_interval()
@@ -683,11 +680,11 @@ def main() -> None:
         # Performance and DB stats toggles
         st.subheader("Additional Information")
         show_perf = st.checkbox("Show performance metrics", value=True)
-        show_db_stats = st.checkbox("Show database statistics", value=USE_DATABASE)
-        # Log display
-        st.subheader("Logs")
-        # Logs will be populated during processing; display a placeholder here
-        log_area = st.empty()
+        # We no longer provide a checkbox for database statistics; they will be displayed
+        # automatically in the main area when available.
+        # Placeholder for logs (not displayed to the user).  We still collect
+        # logs internally for debugging but do not show them.
+        log_area = None
     # Create tabs for each time interval
     tabs = st.tabs(list(TIME_INTERVALS.keys()))
     for i, (interval_name, interval_config) in enumerate(TIME_INTERVALS.items()):
@@ -721,21 +718,22 @@ def main() -> None:
                     st.caption(f"Metrics generated at {perf_metrics['generated_at']}")
         else:
             st.info("Performance metrics not available yet.")
-    if show_db_stats and USE_DATABASE:
+    # Show database statistics in the main area when available
+    if USE_DATABASE:
         st.header("💾 Database Statistics (24h)")
         stats = load_database_stats()
         if stats:
-            col1, col2, col3 = st.columns(3)
-            with col1:
+            c1, c2, c3 = st.columns(3)
+            with c1:
                 st.metric("Total Trades", f"{stats.get('total_trades', 0):,}")
                 st.metric("Average Price", f"${stats.get('avg_price', 0):,.2f}")
-            with col2:
+            with c2:
                 st.metric("Total Anomalies", f"{stats.get('total_anomalies', 0):,}")
                 st.metric("Max |Z-Score|", f"{stats.get('max_z_score', 0):.2f}")
-            with col3:
+            with c3:
                 st.metric("Anomaly Rate", f"{stats.get('anomaly_rate', 0) * 100:.2f}%")
                 st.metric("Max Volume Spike", f"{stats.get('max_volume_spike', 0):.1f}x")
-            # Anomaly breakdown bar chart
+            # Bar chart breakdown of anomalies
             if 'anomaly_breakdown' in stats and stats['anomaly_breakdown']:
                 breakdown_df = pd.DataFrame.from_dict(stats['anomaly_breakdown'], orient='index', columns=['Count']).reset_index()
                 breakdown_df.columns = ['Type', 'Count']
@@ -745,12 +743,7 @@ def main() -> None:
                 st.plotly_chart(fig_breakdown, use_container_width=True)
         else:
             st.info("Database statistics not available.")
-    # Display logs collected during processing
-    with st.sidebar:
-        if logs:
-            log_area.text("\n".join(logs))
-        else:
-            log_area.text("No logs generated yet.")
+    # Logs are collected internally but not displayed in the UI
 
 
 if __name__ == "__main__":
