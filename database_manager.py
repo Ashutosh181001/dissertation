@@ -235,22 +235,32 @@ class DatabaseManager:
             
             conn.commit()
             return cursor.lastrowid
-    
-    def get_recent_trades(self, minutes: int = 60, limit: Optional[int] = None) -> pd.DataFrame:
+
+    def get_recent_trades(self, minutes: Optional[int] = 60, limit: Optional[int] = None) -> pd.DataFrame:
         """Get recent trades within the specified time window"""
-        cutoff_time = datetime.now() - timedelta(minutes=minutes)
-        
-        query = '''
-            SELECT * FROM trades
-            WHERE timestamp >= ?
-            ORDER BY timestamp DESC
-        '''
-        
+
+        if minutes is None:
+            # Return all trades when minutes is None
+            query = '''
+                SELECT * FROM trades
+                ORDER BY timestamp DESC
+            '''
+            params = ()
+        else:
+            # Return trades within the specified time window
+            cutoff_time = datetime.now() - timedelta(minutes=minutes)
+            query = '''
+                SELECT * FROM trades
+                WHERE timestamp >= ?
+                ORDER BY timestamp DESC
+            '''
+            params = (cutoff_time.isoformat(),)
+
         if limit:
             query += f' LIMIT {limit}'
-            
+
         with self.get_connection() as conn:
-            return pd.read_sql_query(query, conn, params=(cutoff_time.isoformat(),))
+            return pd.read_sql_query(query, conn, params=params)
     
     def get_recent_anomalies(self, minutes: int = 60, anomaly_types: Optional[List[str]] = None) -> pd.DataFrame:
         """Get recent anomalies within the specified time window"""

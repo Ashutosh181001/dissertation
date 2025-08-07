@@ -68,18 +68,17 @@ def load_trades(minutes: int, logs: List[str], allow_fallback: bool = True) -> p
     window, the function will attempt to load a fixed number of recent
     trades to avoid empty displays.
     """
-    cutoff = datetime.utcnow() - timedelta(minutes=minutes)
     df: pd.DataFrame = pd.DataFrame()
-    # Try database: fetch a broad set of recent trades and filter locally by cutoff.
+
+    # Try database first
     if USE_DATABASE and db is not None:
         try:
-            # Do not pass minutes to the database query to ensure we retrieve the latest trades.
-            df = db.get_recent_trades(minutes=None, limit=None)
+            # Pass the actual minutes to the database for efficient querying
+            df = db.get_recent_trades(minutes=minutes, limit=None)
             if df is not None and not df.empty:
                 df['timestamp'] = pd.to_datetime(df['timestamp'], errors="coerce")
-                # Filter by cutoff to restrict to the selected interval
-                df = df[df['timestamp'] >= cutoff]
-                for col in ['price', 'quantity', 'z_score', 'rolling_mean', 'rolling_std', 'price_change_pct', 'time_gap_sec']:
+                for col in ['price', 'quantity', 'z_score', 'rolling_mean', 'rolling_std', 'price_change_pct',
+                            'time_gap_sec']:
                     if col in df.columns:
                         df[col] = pd.to_numeric(df[col], errors='coerce')
                 df.sort_values('timestamp', inplace=True)
@@ -87,14 +86,17 @@ def load_trades(minutes: int, logs: List[str], allow_fallback: bool = True) -> p
                 return df
         except Exception as e:
             log_message(logs, f"Database trade load error: {e}; falling back to CSV")
-    # Try CSV
+
+    # Try CSV fallback
+    cutoff = datetime.utcnow() - timedelta(minutes=minutes)
     if os.path.exists(TRADE_LOG):
         try:
             trades = pd.read_csv(TRADE_LOG)
             if not trades.empty:
                 trades['timestamp'] = pd.to_datetime(trades['timestamp'], errors="coerce")
                 trades = trades[trades['timestamp'] >= cutoff]
-                for col in ['price', 'quantity', 'z_score', 'rolling_mean', 'rolling_std', 'price_change_pct', 'time_gap_sec']:
+                for col in ['price', 'quantity', 'z_score', 'rolling_mean', 'rolling_std', 'price_change_pct',
+                            'time_gap_sec']:
                     if col in trades.columns:
                         trades[col] = pd.to_numeric(trades[col], errors='coerce')
                 trades.sort_values('timestamp', inplace=True)
@@ -102,31 +104,33 @@ def load_trades(minutes: int, logs: List[str], allow_fallback: bool = True) -> p
                 return trades
         except Exception as e:
             log_message(logs, f"CSV trade load error: {e}")
-    # Fallback to recent trades
+
+    # Fallback to recent trades if no data found and fallback is allowed
     if allow_fallback:
-        # Fallback: load recent trades for the same interval using a limited number of records.
         if USE_DATABASE and db is not None:
             try:
+                # Get recent trades without time restriction, but with limit
                 fallback = db.get_recent_trades(minutes=None, limit=MAX_BUFFER)
                 if fallback is not None and not fallback.empty:
                     fallback['timestamp'] = pd.to_datetime(fallback['timestamp'], errors="coerce")
-                    fallback = fallback[fallback['timestamp'] >= cutoff]
-                    for col in ['price', 'quantity', 'z_score', 'rolling_mean', 'rolling_std', 'price_change_pct', 'time_gap_sec']:
+                    for col in ['price', 'quantity', 'z_score', 'rolling_mean', 'rolling_std', 'price_change_pct',
+                                'time_gap_sec']:
                         if col in fallback.columns:
                             fallback[col] = pd.to_numeric(fallback[col], errors='coerce')
                     fallback.sort_values('timestamp', inplace=True)
-                    log_message(logs, f"Fallback: loaded {len(fallback)} trades from database")
+                    log_message(logs, f"Fallback: loaded {len(fallback)} recent trades from database")
                     return fallback
             except Exception as e:
                 log_message(logs, f"Database fallback error: {e}")
-        # CSV fallback: load recent trades for the same interval and limit to MAX_BUFFER
+
+        # CSV fallback
         if os.path.exists(TRADE_LOG):
             try:
                 trades = pd.read_csv(TRADE_LOG)
                 if not trades.empty:
                     trades['timestamp'] = pd.to_datetime(trades['timestamp'], errors="coerce")
-                    trades = trades[trades['timestamp'] >= cutoff]
-                    for col in ['price', 'quantity', 'z_score', 'rolling_mean', 'rolling_std', 'price_change_pct', 'time_gap_sec']:
+                    for col in ['price', 'quantity', 'z_score', 'rolling_mean', 'rolling_std', 'price_change_pct',
+                                'time_gap_sec']:
                         if col in trades.columns:
                             trades[col] = pd.to_numeric(trades[col], errors='coerce')
                     trades.sort_values('timestamp', inplace=True)
@@ -135,6 +139,7 @@ def load_trades(minutes: int, logs: List[str], allow_fallback: bool = True) -> p
                     return trades
             except Exception as e:
                 log_message(logs, f"CSV fallback error: {e}")
+
     log_message(logs, "No trades available")
     return df
 
