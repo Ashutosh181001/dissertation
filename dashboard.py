@@ -44,16 +44,46 @@ DEFAULT_TAB_REFRESH = DEFAULT_LIVE_REFRESH
 # Time interval configuration
 TIME_INTERVALS: Dict[str, Dict[str, Optional[int]]] = {
     "Live": {"minutes": 10, "refresh": DEFAULT_LIVE_REFRESH, "candle_interval": "1min"},
-    "15m": {"minutes": 15, "refresh": None, "candle_interval": "1min"},
-    "1h": {"minutes": 60, "refresh": None, "candle_interval": "1min"},
-    "4h": {"minutes": 240, "refresh": None, "candle_interval": "5min"},
-    "1D": {"minutes": 1440, "refresh": None, "candle_interval": "15min"},
-    "1W": {"minutes": 10080, "refresh": None, "candle_interval": "1H"},
+    "15m": {"minutes": 15, "refresh": 30, "candle_interval": "1min"},
+    "1h": {"minutes": 60, "refresh": 60, "candle_interval": "1min"},
+    "4h": {"minutes": 240, "refresh": 120, "candle_interval": "5min"},
+    "1D": {"minutes": 1440, "refresh": 300, "candle_interval": "15min"},
+    "1W": {"minutes": 10080, "refresh": 600, "candle_interval": "1h"},
 }
 
 # Maximum number of trades for fallback
 MAX_BUFFER = 400
 
+
+@st.cache_data(ttl=10)  # Reduced TTL for more frequent updates
+def cached_load_trades(minutes: int, timestamp_key: str) -> pd.DataFrame:
+    """Cached version of load_trades to reduce database hits"""
+    logs = []
+    # For live data (minutes <= 10), always allow fallback
+    return load_trades(minutes, logs, allow_fallback=(minutes <= 15))
+
+@st.cache_data(ttl=10)  # Reduced TTL for more frequent updates
+def cached_load_anomalies(minutes: int, anomaly_types: List[str], timestamp_key: str) -> pd.DataFrame:
+    """Cached version of load_anomalies"""
+    logs = []
+    return load_anomalies(minutes, logs, anomaly_types)
+
+@st.cache_data(ttl=60)
+def create_zscore_chart_cached(trades_df_hash: str, timestamps: List[str], z_scores: List[float]) -> go.Figure:
+    """Cached Z-score chart creation"""
+    z_fig = go.Figure()
+    z_fig.add_trace(go.Scatter(
+        x=timestamps,
+        y=z_scores,
+        mode='lines',
+        name='Z-Score',
+        line=dict(color='#2ca02c', width=2)
+    ))
+    z_fig.add_hline(y=3, line_dash="dash", line_color="red", annotation_text="Upper", annotation_position="top right")
+    z_fig.add_hline(y=-3, line_dash="dash", line_color="red", annotation_text="Lower", annotation_position="bottom right")
+    z_fig.add_hline(y=0, line_dash="dot", line_color="gray")
+    z_fig.update_layout(height=300, template='plotly_dark', xaxis_title='', yaxis_title='Z-Score')
+    return z_fig
 
 def log_message(logs: List[str], message: str) -> None:
     """Internal logging helper.  Does not render to UI."""
@@ -303,60 +333,101 @@ def create_line_chart(trades_df: pd.DataFrame, anomalies_df: pd.DataFrame, show_
 
 
 def display_interval(interval_name: str, interval_config: Dict[str, Optional[int]], chart_type: str,
-                    show_indicators: Dict[str, bool], selected_anomaly_types: List[str], logs: List[str]) -> None:
+                     show_indicators: Dict[str, bool], selected_anomaly_types: List[str], logs: List[str]) -> None:
     """Display a single tab's content."""
     minutes = interval_config.get("minutes", 60) or 60
-    # Determine refresh interval: if no explicit refresh is provided for this
-    # interval, fall back to DEFAULT_TAB_REFRESH so that all tabs refresh
-    # periodically without requiring a full page reload.  This mirrors the
-    # behaviour of the Live tab but avoids jumping to the top of the page.
+    # Use the specific refresh interval or fall back to DEFAULT_TAB_REFRESH
     refresh_interval = interval_config.get("refresh") or DEFAULT_TAB_REFRESH
-    # Allow fallback to recent trades only for the Live interval.  Other
-    # intervals will show data strictly within the selected time window.
     allow_fallback = (interval_name == "Live")
-    # Use a fragment with the computed refresh interval.  Every interval
-    # therefore refreshes automatically.
+
     frag_decorator = st.fragment(run_every=refresh_interval)
+
     @frag_decorator
     def render_interval() -> None:
-        trades_df = load_trades(minutes, logs, allow_fallback=allow_fallback)
-        anomalies_df = load_anomalies(minutes, logs, selected_anomaly_types)
+        # Create cache key based on current time and refresh interval
+        current_time = datetime.utcnow()
+
+        # For live data, use shorter cache periods
+        if interval_name == "Live":
+            cache_key_str = current_time.strftime("%Y%m%d_%H%M%S")[:-1]  # Remove last digit for 10-second buckets
+        elif refresh_interval <= 60:
+            cache_key_str = current_time.strftime("%Y%m%d_%H%M")  # 1-minute buckets
+        else:
+            cache_minutes = refresh_interval // 60
+            cache_key = current_time.replace(second=0, microsecond=0)
+            cache_key = cache_key.replace(minute=(cache_key.minute // cache_minutes) * cache_minutes)
+            cache_key_str = cache_key.strftime("%Y%m%d_%H%M")
+
+        # Load data with caching
+        try:
+            trades_df = cached_load_trades(minutes, cache_key_str)
+            anomalies_df = cached_load_anomalies(minutes, selected_anomaly_types, cache_key_str)
+        except Exception:
+            # Fallback to non-cached if caching fails
+            trades_df = load_trades(minutes, logs, allow_fallback=allow_fallback)
+            anomalies_df = load_anomalies(minutes, logs, selected_anomaly_types)
+
         if trades_df.empty:
             st.warning(f"No trade data available for {interval_name}")
             st.info("Ensure that your data source is running and contains data for the selected time window.")
             return
+
         create_metrics_row(trades_df, anomalies_df, interval_name)
         st.markdown("<br>", unsafe_allow_html=True)
+
         try:
             if chart_type == "Candlestick":
-                candlesticks = aggregate_to_candlesticks(trades_df, interval_config.get("candle_interval", "1min") or "1min")
-                fig_main = create_candlestick_chart(candlesticks, trades_df, anomalies_df, show_indicators, interval_name)
+                candlesticks = aggregate_to_candlesticks(trades_df,
+                                                         interval_config.get("candle_interval", "1min") or "1min")
+                fig_main = create_candlestick_chart(candlesticks, trades_df, anomalies_df, show_indicators,
+                                                    interval_name)
             else:
                 fig_main = create_line_chart(trades_df, anomalies_df, show_indicators)
-            st.plotly_chart(fig_main, use_container_width=True)
+
+            # Add unique key for main chart
+            st.plotly_chart(fig_main, use_container_width=True, key=f"main_chart_{interval_name}_{chart_type}")
+
         except Exception as e:
             st.error(f"Error creating chart: {e}")
             st.info("Displaying basic price line chart as fallback.")
             import plotly.express as px
             fallback_fig = px.line(trades_df, x='timestamp', y='price', title=f'BTC/USDT Price - {interval_name}')
             fallback_fig.update_layout(template='plotly_dark')
-            st.plotly_chart(fallback_fig, use_container_width=True)
-        # Z-score chart
+            # Add unique key for fallback chart
+            st.plotly_chart(fallback_fig, use_container_width=True, key=f"fallback_chart_{interval_name}")
+
+        # Z-score chart with caching and unique key
         st.subheader("📉 Z-Score Over Time")
         if 'z_score' in trades_df.columns and not trades_df['z_score'].isna().all():
-            z_fig = go.Figure()
-            z_fig.add_trace(go.Scatter(x=trades_df['timestamp'], y=trades_df['z_score'], mode='lines', name='Z-Score', line=dict(color='#2ca02c', width=2)))
-            z_fig.add_hline(y=3, line_dash="dash", line_color="red", annotation_text="Upper", annotation_position="top right")
-            z_fig.add_hline(y=-3, line_dash="dash", line_color="red", annotation_text="Lower", annotation_position="bottom right")
-            z_fig.add_hline(y=0, line_dash="dot", line_color="gray")
-            z_fig.update_layout(height=300, template='plotly_dark', xaxis_title='', yaxis_title='Z-Score')
-            st.plotly_chart(z_fig, use_container_width=True)
+            try:
+                # Prepare data for cached chart creation
+                clean_df = trades_df[['timestamp', 'z_score']].dropna()
+                timestamps = clean_df['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S').tolist()
+                z_scores = clean_df['z_score'].tolist()
+                df_hash = f"{len(clean_df)}_{interval_name}_{cache_key_str}"
+
+                z_fig = create_zscore_chart_cached(df_hash, timestamps, z_scores)
+                st.plotly_chart(z_fig, use_container_width=True, key=f"zscore_chart_{interval_name}")
+            except Exception:
+                # Fallback to non-cached version
+                z_fig = go.Figure()
+                z_fig.add_trace(
+                    go.Scatter(x=trades_df['timestamp'], y=trades_df['z_score'], mode='lines', name='Z-Score',
+                               line=dict(color='#2ca02c', width=2)))
+                z_fig.add_hline(y=3, line_dash="dash", line_color="red", annotation_text="Upper",
+                                annotation_position="top right")
+                z_fig.add_hline(y=-3, line_dash="dash", line_color="red", annotation_text="Lower",
+                                annotation_position="bottom right")
+                z_fig.add_hline(y=0, line_dash="dot", line_color="gray")
+                z_fig.update_layout(height=300, template='plotly_dark', xaxis_title='', yaxis_title='Z-Score')
+                st.plotly_chart(z_fig, use_container_width=True, key=f"zscore_chart_{interval_name}")
         else:
             st.info("Z-score data not available.")
-        # Anomalies table
+
+        # Anomalies table (limit to 20 rows for performance)
         if not anomalies_df.empty:
             st.subheader("🚨 Recent Anomalies")
-            display_df = anomalies_df.copy()
+            display_df = anomalies_df.copy().head(20)  # Limit rows for performance
             display_df['timestamp'] = display_df['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
             if 'price' in display_df.columns:
                 display_df['price'] = display_df['price'].apply(lambda x: f"${x:,.2f}")
@@ -365,10 +436,11 @@ def display_interval(interval_name: str, interval_config: Dict[str, Optional[int
             cols = ['timestamp', 'anomaly_type', 'price', 'z_score']
             display_df = display_df[cols]
             display_df.columns = ['Timestamp', 'Type', 'Price', 'Z-Score']
-            display_df = display_df.head(20)
             st.dataframe(display_df, use_container_width=True)
+
         # Last update
         st.caption(f"Last updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
+
     render_interval()
 
 
@@ -421,7 +493,7 @@ def main() -> None:
         else:
             st.info("Performance metrics not available yet.")
     # Database statistics fragment displayed below
-    @st.fragment
+    @st.fragment(run_every=60)  # Refresh every minute
     def show_database_stats() -> None:
         if USE_DATABASE:
             st.header("💾 Database Statistics (24h)")
@@ -437,16 +509,20 @@ def main() -> None:
                 with c3:
                     st.metric("Anomaly Rate", f"{stats.get('anomaly_rate', 0) * 100:.2f}%")
                     st.metric("Max Volume Spike", f"{stats.get('max_volume_spike', 0):.1f}x")
+
                 if 'anomaly_breakdown' in stats and stats['anomaly_breakdown']:
-                    breakdown_df = pd.DataFrame.from_dict(stats['anomaly_breakdown'], orient='index', columns=['Count']).reset_index()
+                    breakdown_df = pd.DataFrame.from_dict(stats['anomaly_breakdown'], orient='index',
+                                                          columns=['Count']).reset_index()
                     breakdown_df.columns = ['Type', 'Count']
                     import plotly.express as px
                     fig_breakdown = px.bar(breakdown_df, x='Type', y='Count', title='Anomalies by Type (24h)')
                     fig_breakdown.update_layout(template='plotly_dark')
-                    st.plotly_chart(fig_breakdown, use_container_width=True)
+                    # Add unique key for breakdown chart
+                    st.plotly_chart(fig_breakdown, use_container_width=True, key="anomaly_breakdown_chart")
             else:
                 st.info("Database statistics not available.")
-    show_database_stats()
+
+        show_database_stats()
 
 
 if __name__ == "__main__":
